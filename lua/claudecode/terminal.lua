@@ -141,6 +141,14 @@ local function get_provider()
     else
       logger.warn("terminal", "'snacks' provider configured, but Snacks.nvim not available. Falling back to 'native'.")
     end
+  elseif config.provider == "detach" then
+    local detach_provider = load_provider("detach")
+    if detach_provider and detach_provider.is_available() then
+      logger.debug("terminal", "Using detach terminal provider")
+      return detach_provider
+    else
+      logger.warn("terminal", "'detach' provider configured, but detach provider not available. Falling back to 'native'.")
+    end
   elseif config.provider == "native" then
     -- noop, will use native provider as default below
     logger.debug("terminal", "Using native terminal provider")
@@ -307,7 +315,7 @@ function M.setup(user_term_config, p_terminal_cmd, p_env)
         config[k] = v
       elseif k == "split_width_percentage" and type(v) == "number" and v > 0 and v < 1 then
         config[k] = v
-      elseif k == "provider" and (v == "snacks" or v == "native" or v == "auto" or type(v) == "table") then
+      elseif k == "provider" and (v == "snacks" or v == "native" or v == "auto" or v == "detach" or type(v) == "table") then
         config[k] = v
       elseif k == "show_native_term_exit_tip" and type(v) == "boolean" then
         config[k] = v
