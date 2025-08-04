@@ -1,0 +1,11 @@
+[workspace]
+authors = ["fecet <xiezej@gmail.com>"]
+channels = ["https://repo.prefix.dev/meta-forge", "conda-forge"]
+name = "claudecode.nvim"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+install = 'echo "source $PWD/scripts/claude_shell_helpers.sh" > $PIXI_HOME/hooks/zsh/cc.sh'
+
+[dependencies]
