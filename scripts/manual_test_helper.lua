@@ -5,7 +5,7 @@ local function test_opendiff_directly()
   print("🧪 Testing openDiff tool directly...")
 
   -- Use the actual README.md file like the real scenario
-  local readme_path = "/Users/thomask33/GitHub/claudecode.nvim/README.md"
+  local readme_path = "README.md"
 
   -- Check if README exists
   if vim.fn.filereadable(readme_path) == 0 then

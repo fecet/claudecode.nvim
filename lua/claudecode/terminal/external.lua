@@ -120,7 +120,6 @@ function M.open(cmd_string, env_table)
   cwd_for_jobstart = cwd_for_jobstart or (vim.fn.getcwd and vim.fn.getcwd() or nil)
 
   jobid = vim.fn.jobstart(cmd_parts, {
-    detach = true,
     env = env_table,
     cwd = cwd_for_jobstart,
     on_exit = function(job_id, exit_code, _)
