@@ -417,4 +417,15 @@ function M.shuffle_array(tbl)
   end
 end
 
+---Generate a simple UUID v4 (random)
+---@return string uuid A UUID v4 string
+function M.generate_uuid()
+  -- Simple UUID v4 generation (random)
+  local template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
+  return string.gsub(template, '[xy]', function(c)
+    local v = (c == 'x') and math.random(0, 0xf) or math.random(8, 0xb)
+    return string.format('%x', v)
+  end)
+end
+
 return M

@@ -31,6 +31,10 @@ M.defaults = {
     { name = "Claude Haiku 3.5 (Latest)", value = "haiku" },
   },
   terminal = nil, -- Will be lazy-loaded to avoid circular dependency
+  sse = {
+    enabled = true, -- SSE server enabled by default
+    path = "/mcp", -- SSE endpoint path
+  },
 }
 
 ---Validates the provided configuration table.
@@ -129,6 +133,17 @@ function M.validate(config)
     assert(type(model) == "table", "models[" .. i .. "] must be a table")
     assert(type(model.name) == "string" and model.name ~= "", "models[" .. i .. "].name must be a non-empty string")
     assert(type(model.value) == "string" and model.value ~= "", "models[" .. i .. "].value must be a non-empty string")
+  end
+
+  -- Validate SSE configuration
+  if config.sse then
+    assert(type(config.sse) == "table", "sse must be a table")
+    if config.sse.enabled ~= nil then
+      assert(type(config.sse.enabled) == "boolean", "sse.enabled must be a boolean")
+    end
+    if config.sse.path ~= nil then
+      assert(type(config.sse.path) == "string" and config.sse.path:match("^/"), "sse.path must be a string starting with /")
+    end
   end
 
   return true

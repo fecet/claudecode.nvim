@@ -486,14 +486,38 @@ function M._create_commands()
     desc = "Stop Claude Code integration",
   })
 
-  vim.api.nvim_create_user_command("ClaudeCodeStatus", function()
+  vim.api.nvim_create_user_command("ClaudeCodeStatus", function(cmd_opts)
+    -- Check for json flag
+    local output_json = cmd_opts.args and cmd_opts.args:match("%-%-json")
+    
     if M.state.server and M.state.port then
-      logger.info("command", "Claude Code integration is running on port " .. tostring(M.state.port))
+      if output_json then
+        -- Machine-readable JSON output
+        local status = {
+          running = true,
+          port = M.state.port,
+          sse_enabled = M.config.sse and M.config.sse.enabled or false,
+          sse_path = M.config.sse and M.config.sse.path or "/mcp",
+          lock_file = vim.fn.expand("~/.claude/ide/" .. M.state.port .. ".lock")
+        }
+        print(vim.json.encode(status))
+      else
+        -- Human-readable output
+        logger.info("command", "Claude Code integration is running on port " .. tostring(M.state.port))
+        if M.config.sse and M.config.sse.enabled then
+          logger.info("command", "SSE MCP server enabled on path: " .. (M.config.sse.path or "/mcp"))
+        end
+      end
     else
-      logger.info("command", "Claude Code integration is not running")
+      if output_json then
+        print(vim.json.encode({ running = false }))
+      else
+        logger.info("command", "Claude Code integration is not running")
+      end
     end
   end, {
-    desc = "Show Claude Code integration status",
+    desc = "Show Claude Code integration status (use --json for machine-readable output)",
+    nargs = "?",
   })
 
   ---@param file_paths table List of file paths to add

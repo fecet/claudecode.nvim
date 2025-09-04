@@ -13,6 +13,9 @@ local M = {}
 ---@field handshake_complete boolean Whether WebSocket handshake is complete
 ---@field last_ping number Timestamp of last ping sent
 ---@field last_pong number Timestamp of last pong received
+---@field client_type string|nil Client type: "websocket", "sse", "http_post", "http_options", "http_unknown"
+---@field route_determined boolean|nil Whether the route has been determined
+---@field session_id string|nil Session ID for SSE clients
 
 ---Create a new WebSocket client
 ---@param tcp_handle table The vim.loop TCP handle
@@ -41,6 +44,11 @@ end
 ---@param on_error function Callback for errors: function(client, error_msg)
 ---@param auth_token string|nil Expected authentication token for validation
 function M.process_data(client, data, on_message, on_close, on_error, auth_token)
+  -- Skip processing for non-WebSocket clients
+  if client.client_type and client.client_type ~= "websocket" then
+    return
+  end
+  
   client.buffer = client.buffer .. data
 
   if not client.handshake_complete then
@@ -97,6 +105,11 @@ function M.process_data(client, data, on_message, on_close, on_error, auth_token
           client.state = "connected"
           client.buffer = remaining
           logger.debug("client", "WebSocket connection established for client:", client.id)
+          
+          -- Call WebSocket connected callback if provided
+          if client.on_ws_connected then
+            client.on_ws_connected()
+          end
 
           if #client.buffer > 0 then
             M.process_data(client, "", on_message, on_close, on_error, auth_token)
@@ -182,9 +195,27 @@ function M.send_message(client, message, callback)
     end
     return
   end
-
-  local text_frame = frame.create_text_frame(message)
-  client.tcp_handle:write(text_frame, callback)
+  
+  -- Only send WebSocket frames to WebSocket clients
+  if client.client_type == "websocket" or not client.client_type then
+    local text_frame = frame.create_text_frame(message)
+    client.tcp_handle:write(text_frame, callback)
+  elseif client.client_type == "sse" then
+    -- For SSE clients, send as SSE event
+    local sse = require("claudecode.server.sse")
+    local success, data = pcall(vim.json.decode, message)
+    if success then
+      sse.send_sse_event(client, data)
+    else
+      if callback then
+        callback("Failed to parse message as JSON for SSE")
+      end
+    end
+  else
+    if callback then
+      callback("Cannot send message to " .. (client.client_type or "unknown") .. " client")
+    end
+  end
 end
 
 ---Send a ping to a client
@@ -211,14 +242,21 @@ function M.close_client(client, code, reason)
 
   code = code or 1000
   reason = reason or ""
-
-  if client.handshake_complete then
-    local close_frame = frame.create_close_frame(code, reason)
-    client.tcp_handle:write(close_frame, function()
+  
+  -- Only send WebSocket close frame for WebSocket clients
+  if client.client_type == "websocket" or not client.client_type then
+    if client.handshake_complete then
+      local close_frame = frame.create_close_frame(code, reason)
+      client.tcp_handle:write(close_frame, function()
+        client.state = "closed"
+        client.tcp_handle:close()
+      end)
+    else
       client.state = "closed"
       client.tcp_handle:close()
-    end)
+    end
   else
+    -- For non-WebSocket clients, just close the connection
     client.state = "closed"
     client.tcp_handle:close()
   end
@@ -248,6 +286,8 @@ function M.get_client_info(client)
   return {
     id = client.id,
     state = client.state,
+    client_type = client.client_type,
+    session_id = client.session_id,
     handshake_complete = client.handshake_complete,
     buffer_size = #client.buffer,
     last_ping = client.last_ping,

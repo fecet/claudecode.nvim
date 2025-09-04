@@ -36,12 +36,16 @@ function M.start(config, auth_token)
 
   M.state.auth_token = auth_token
 
-  -- Log authentication state
+  -- Log authentication state and SSE configuration
   if auth_token then
-    logger.debug("server", "Starting WebSocket server with authentication enabled")
+    logger.debug("server", "Starting server with authentication enabled")
     logger.debug("server", "Auth token length:", #auth_token)
   else
-    logger.debug("server", "Starting WebSocket server WITHOUT authentication (insecure)")
+    logger.debug("server", "Starting server WITHOUT authentication (insecure)")
+  end
+  
+  if config.sse and config.sse.enabled then
+    logger.info("server", "SSE MCP server enabled on path:", config.sse.path or "/mcp")
   end
 
   M.register_handlers()
@@ -55,26 +59,30 @@ function M.start(config, auth_token)
     on_connect = function(client)
       M.state.clients[client.id] = client
 
-      -- Log connection with auth status
+      -- Log connection with auth status and client type
+      local client_type = client.client_type or "websocket"
       if M.state.auth_token then
-        logger.debug("server", "Authenticated WebSocket client connected:", client.id)
+        logger.debug("server", "Authenticated " .. client_type .. " client connected:", client.id)
       else
-        logger.debug("server", "WebSocket client connected (no auth):", client.id)
+        logger.debug("server", client_type .. " client connected (no auth):", client.id)
       end
 
-      -- Notify main module about new connection for queue processing
-      local main_module = require("claudecode")
-      if main_module.process_mention_queue then
-        vim.schedule(function()
-          main_module.process_mention_queue(true)
-        end)
+      -- Notify main module about new connection for queue processing (WebSocket only)
+      if client_type == "websocket" then
+        local main_module = require("claudecode")
+        if main_module.process_mention_queue then
+          vim.schedule(function()
+            main_module.process_mention_queue(true)
+          end)
+        end
       end
     end,
     on_disconnect = function(client, code, reason)
       M.state.clients[client.id] = nil
+      local client_type = client.client_type or "websocket"
       logger.debug(
         "server",
-        "WebSocket client disconnected:",
+        client_type .. " client disconnected:",
         client.id,
         "(code:",
         code,
@@ -83,8 +91,9 @@ function M.start(config, auth_token)
       )
     end,
     on_error = function(error_msg)
-      logger.error("server", "WebSocket server error:", error_msg)
+      logger.error("server", "Server error:", error_msg)
     end,
+    server_instance = M,  -- Pass server instance for SSE handlers
   }
 
   local server, error_msg = tcp_server.create_server(config, callbacks, M.state.auth_token)
@@ -330,6 +339,47 @@ function M.register_handlers()
             data = "Tool handler returned unexpected format",
           }
       end
+    end,
+
+    -- Resource methods (minimal implementation for MCP compliance)
+    ["resources/list"] = function(client, params)
+      logger.debug("server", "Received resources/list request")
+      return {
+        resources = {}, -- Empty array for now
+      }
+    end,
+
+    ["resources/read"] = function(client, params)
+      logger.debug("server", "Received resources/read request for:", params and params.uri)
+      return nil,
+        {
+          code = -32002,
+          message = "Resource not found",
+          data = "Resource system not implemented",
+        }
+    end,
+
+    ["resources/subscribe"] = function(client, params)
+      logger.debug("server", "Received resources/subscribe request for:", params and params.uri)
+      -- Accept subscription but do nothing (no-op)
+      return vim.empty_dict()
+    end,
+
+    ["resources/unsubscribe"] = function(client, params)
+      logger.debug("server", "Received resources/unsubscribe request for:", params and params.uri)
+      -- Accept unsubscribe but do nothing (no-op)
+      return vim.empty_dict()
+    end,
+
+    -- Additional prompt methods
+    ["prompts/get"] = function(client, params)
+      logger.debug("server", "Received prompts/get request for:", params and params.name)
+      return nil,
+        {
+          code = -32002,
+          message = "Prompt not found",
+          data = "No prompts defined",
+        }
     end,
   }
 end

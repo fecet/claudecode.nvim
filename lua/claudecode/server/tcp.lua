@@ -1,6 +1,10 @@
 ---@brief TCP server implementation using vim.loop
 local client_manager = require("claudecode.server.client")
 local utils = require("claudecode.server.utils")
+local router = require("claudecode.server.router")
+local sse = require("claudecode.server.sse")
+local handshake = require("claudecode.server.handshake")
+local logger = require("claudecode.logger")
 
 local M = {}
 
@@ -71,10 +75,12 @@ function M.create_server(config, callbacks, auth_token)
     port = port,
     auth_token = auth_token,
     clients = {},
+    config = config,  -- Store config for SSE routing
     on_message = callbacks.on_message or function() end,
     on_connect = callbacks.on_connect or function() end,
     on_disconnect = callbacks.on_disconnect or function() end,
     on_error = callbacks.on_error or function() end,
+    server_instance = callbacks.server_instance, -- Reference to main server for SSE handlers
   }
 
   local bind_success, bind_err = tcp_server:bind("127.0.0.1", port)
@@ -101,7 +107,7 @@ function M.create_server(config, callbacks, auth_token)
   return server, nil
 end
 
----Handle a new client connection
+---Handle a new client connection with routing
 ---@param server TCPServer The server object
 function M._handle_new_connection(server)
   local client_tcp = vim.loop.new_tcp()
@@ -117,11 +123,14 @@ function M._handle_new_connection(server)
     return
   end
 
-  -- Create WebSocket client wrapper
+  -- Create client wrapper
   local client = client_manager.create_client(client_tcp)
   server.clients[client.id] = client
-
-  -- Set up data handler
+  
+  -- Flag to track if we've determined the connection type
+  client.route_determined = false
+  
+  -- Set up data handler with routing logic
   client_tcp:read_start(function(err, data)
     if err then
       server.on_error("Client read error: " .. err)
@@ -132,23 +141,168 @@ function M._handle_new_connection(server)
     if not data then
       -- EOF - client disconnected
       M._remove_client(server, client)
+      if client.client_type == "sse" then
+        sse.cleanup_client(client.id)
+      end
       return
     end
-
-    -- Process incoming data
-    client_manager.process_data(client, data, function(cl, message)
-      server.on_message(cl, message)
-    end, function(cl, code, reason)
-      server.on_disconnect(cl, code, reason)
-      M._remove_client(server, cl)
-    end, function(cl, error_msg)
-      server.on_error("Client " .. cl.id .. " error: " .. error_msg)
-      M._remove_client(server, cl)
-    end, server.auth_token)
+    
+    -- Buffer incoming data
+    client.buffer = (client.buffer or "") .. data
+    
+    -- If route not determined yet, try to parse HTTP request
+    if not client.route_determined then
+      -- Check if we have complete headers
+      local headers_complete, request, remaining = handshake.extract_http_request(client.buffer)
+      
+      if headers_complete and request then
+        -- Parse and route the request
+        local request_info = router.parse_http_request(request)
+        local route_type, path = router.determine_route(request_info, server.config)
+        
+        logger.debug("tcp", "Route determined for client " .. client.id .. ": " .. route_type)
+        client.route_determined = true
+        
+        if route_type == "websocket" then
+          -- Handle as WebSocket - use existing flow
+          client.client_type = "websocket"
+          -- Store callback for WebSocket handshake success
+          client.on_ws_connected = function()
+            server.on_connect(client)
+          end
+          client_manager.process_data(client, "", function(cl, message)
+            server.on_message(cl, message)
+          end, function(cl, code, reason)
+            server.on_disconnect(cl, code, reason)
+            M._remove_client(server, cl)
+          end, function(cl, error_msg)
+            server.on_error("Client " .. cl.id .. " error: " .. error_msg)
+            M._remove_client(server, cl)
+          end, server.auth_token)
+          
+        elseif route_type == "sse" then
+          -- Handle SSE connection
+          client.client_type = "sse"
+          local success, response = sse.handle_sse_connect(client, request)
+          client_tcp:write(response, function(write_err)
+            if write_err then
+              logger.error("tcp", "Failed to send SSE response:", write_err)
+              M._remove_client(server, client)
+            else
+              -- SSE connection established
+              client.state = "connected"
+              client.buffer = remaining
+              server.on_connect(client)
+              
+              -- Start SSE heartbeat timer for this client
+              M._start_sse_heartbeat(server, client)
+            end
+          end)
+          
+        elseif route_type == "post" then
+          -- Handle POST request for messages
+          client.client_type = "http_post"
+          
+          -- Check if we have complete body
+          local body_complete, body = router.has_complete_body(client.buffer)
+          if body_complete then
+            local response = sse.handle_post_message(client.buffer, server.server_instance)
+            client_tcp:write(response, function(write_err)
+              if write_err then
+                logger.error("tcp", "Failed to send POST response:", write_err)
+              end
+              -- Close connection after response
+              M._remove_client(server, client)
+            end)
+          end
+          
+        elseif route_type == "register" then
+          -- Handle POST request for /register
+          client.client_type = "http_register"
+          
+          -- Check if we have complete body
+          local body_complete, body = router.has_complete_body(client.buffer)
+          if body_complete then
+            local response = sse.handle_register(client.buffer, server.server_instance)
+            client_tcp:write(response, function(write_err)
+              if write_err then
+                logger.error("tcp", "Failed to send register response:", write_err)
+              end
+              -- Close connection after response
+              M._remove_client(server, client)
+            end)
+          end
+          
+        elseif route_type == "options" then
+          -- Handle OPTIONS preflight
+          client.client_type = "http_options"
+          local response = sse.handle_options()
+          client_tcp:write(response, function(write_err)
+            if write_err then
+              logger.error("tcp", "Failed to send OPTIONS response:", write_err)
+            end
+            -- Close connection after response
+            M._remove_client(server, client)
+          end)
+          
+        else
+          -- Unknown route - send 404 with path info
+          client.client_type = "http_unknown"
+          local response = router.create_404_response(path)
+          client_tcp:write(response, function(write_err)
+            if write_err then
+              logger.error("tcp", "Failed to send 404 response:", write_err)
+            end
+            -- Close connection after response
+            M._remove_client(server, client)
+          end)
+        end
+      end
+      
+    else
+      -- Route already determined, handle based on client type
+      if client.client_type == "websocket" then
+        -- Continue processing WebSocket data
+        client_manager.process_data(client, "", function(cl, message)
+          server.on_message(cl, message)
+        end, function(cl, code, reason)
+          server.on_disconnect(cl, code, reason)
+          M._remove_client(server, cl)
+        end, function(cl, error_msg)
+          server.on_error("Client " .. cl.id .. " error: " .. error_msg)
+          M._remove_client(server, cl)
+        end, server.auth_token)
+        
+      elseif client.client_type == "http_post" then
+        -- Continue buffering POST body if needed
+        local body_complete = router.has_complete_body(client.buffer)
+        if body_complete then
+          local response = sse.handle_post_message(client.buffer, server.server_instance)
+          client_tcp:write(response, function(write_err)
+            if write_err then
+              logger.error("tcp", "Failed to send POST response:", write_err)
+            end
+            -- Close connection after response
+            M._remove_client(server, client)
+          end)
+        end
+      elseif client.client_type == "http_register" then
+        -- Continue buffering register body if needed
+        local body_complete = router.has_complete_body(client.buffer)
+        if body_complete then
+          local response = sse.handle_register(client.buffer, server.server_instance)
+          client_tcp:write(response, function(write_err)
+            if write_err then
+              logger.error("tcp", "Failed to send register response:", write_err)
+            end
+            -- Close connection after response
+            M._remove_client(server, client)
+          end)
+        end
+      end
+      -- SSE connections stay open, no additional processing needed
+    end
   end)
-
-  -- Notify about new connection
-  server.on_connect(client)
 end
 
 ---Remove a client from the server
@@ -157,6 +311,16 @@ end
 function M._remove_client(server, client)
   if server.clients[client.id] then
     server.clients[client.id] = nil
+    
+    -- Clean up SSE client and heartbeat timer if needed
+    if client.client_type == "sse" then
+      sse.cleanup_client(client.id)
+      if client.heartbeat_timer then
+        client.heartbeat_timer:stop()
+        client.heartbeat_timer:close()
+        client.heartbeat_timer = nil
+      end
+    end
 
     if not client.tcp_handle:is_closing() then
       client.tcp_handle:close()
@@ -256,8 +420,8 @@ function M.start_ping_timer(server, interval)
 
   timer:start(interval, interval, function()
     for _, client in pairs(server.clients) do
-      if client.state == "connected" then
-        -- Check if client is alive
+      if client.state == "connected" and client.client_type == "websocket" then
+        -- Check if client is alive (only for WebSocket clients)
         if client_manager.is_client_alive(client, interval * 2) then
           client_manager.send_ping(client, "ping")
         else
@@ -271,6 +435,47 @@ function M.start_ping_timer(server, interval)
   end)
 
   return timer
+end
+
+---Start SSE heartbeat for a specific client
+---@param server TCPServer The server object
+---@param client table The SSE client
+function M._start_sse_heartbeat(server, client)
+  -- Create a timer specific to this SSE client
+  local heartbeat_timer = vim.loop.new_timer()
+  if not heartbeat_timer then
+    return
+  end
+  
+  -- Store timer reference on client
+  client.heartbeat_timer = heartbeat_timer
+  
+  -- Send heartbeat comment every 30 seconds
+  heartbeat_timer:start(30000, 30000, function()
+    if client.state == "connected" and client.client_type == "sse" then
+      -- Send SSE comment as heartbeat
+      local heartbeat = ":\n\n"  -- SSE comment line
+      client.tcp_handle:write(heartbeat, function(err)
+        if err then
+          logger.debug("tcp", "SSE heartbeat failed for client:", client.id, err)
+          -- Stop timer and remove client on error
+          if client.heartbeat_timer then
+            client.heartbeat_timer:stop()
+            client.heartbeat_timer:close()
+            client.heartbeat_timer = nil
+          end
+          M._remove_client(server, client)
+        end
+      end)
+    else
+      -- Client disconnected, stop timer
+      if client.heartbeat_timer then
+        client.heartbeat_timer:stop()
+        client.heartbeat_timer:close()
+        client.heartbeat_timer = nil
+      end
+    end
+  end)
 end
 
 return M
